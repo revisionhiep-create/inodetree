@@ -1,9 +1,42 @@
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::io;
+use std::path::Path;
 
 use inodetree::actions::{DeleteMode, delete_path, target_path};
 use inodetree::arena::ROOT;
 use inodetree::scan::{ScanConfig, vfs};
+
+fn create_dir_link(target: &Path, link: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(windows)]
+    {
+        match std::os::windows::fs::symlink_dir(target, link) {
+            Ok(()) => Ok(()),
+            // Unprivileged Windows accounts without Developer Mode cannot create symlinks;
+            // fall back to an NTFS junction, which works unprivileged.
+            Err(err) if err.raw_os_error() == Some(1314) => create_junction(target, link),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_junction(target: &Path, link: &Path) -> io::Result<()> {
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()?
+        .status;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("mklink /J failed"))
+    }
+}
 
 #[test]
 fn permanent_delete_removes_files_and_directories() {
@@ -27,7 +60,23 @@ fn deleting_a_directory_symlink_keeps_its_target() {
     fs::create_dir(&target).unwrap();
     fs::write(target.join("keep.txt"), b"x").unwrap();
     let link = dir.path().join("link");
-    symlink(&target, &link).unwrap();
+    create_dir_link(&target, &link).unwrap();
+
+    delete_path(&link, DeleteMode::Permanent).unwrap();
+
+    assert!(fs::symlink_metadata(&link).is_err());
+    assert!(target.join("keep.txt").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn deleting_a_junction_keeps_its_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("keep.txt"), b"x").unwrap();
+    let link = dir.path().join("junction");
+    create_junction(&target, &link).unwrap();
 
     delete_path(&link, DeleteMode::Permanent).unwrap();
 
@@ -61,6 +110,7 @@ fn target_path_rebuilds_existing_paths_and_rejects_vanished_ones() {
     assert!(target_path(&arena, child).is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn target_path_refuses_mount_points() {
     let shm = std::path::Path::new("/dev/shm");

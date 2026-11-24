@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
+
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -10,7 +15,7 @@ use inodetree::scan::{ScanConfig, ScanResult, vfs};
 use inodetree::stats;
 
 #[derive(Parser)]
-#[command(version, about = "Fast Linux disk space analyzer")]
+#[command(version, about = "Fast disk space analyzer")]
 struct Cli {
     /// Directory to scan
     path: Option<PathBuf>,
@@ -20,12 +25,15 @@ struct Cli {
     /// Number of rows in each top list
     #[arg(long, default_value_t = 10)]
     top: usize,
-    /// Show logical size (`stx_size`) in the top lists instead of allocated disk usage
+    /// Show logical size in the top lists instead of allocated disk usage
     #[arg(long)]
     logical: bool,
 }
 
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    attach_parent_console_if_needed();
+
     let cli = Cli::parse();
     if cli.headless {
         return run_headless(&cli);
@@ -127,4 +135,33 @@ fn print_extensions(out: &mut impl Write, arena: &Arena, top: usize) -> io::Resu
         writeln!(out, "{size:>12}  {:>9} files  {label}", entry.file_count)?;
     }
     Ok(())
+}
+
+/// Reattaches stdout/stderr to the parent terminal when launched from a shell with CLI flags,
+/// while preserving `windows_subsystem = "windows"` (no console flash) on GUI double-click.
+#[cfg(windows)]
+fn attach_parent_console_if_needed() {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_UNKNOWN, GetFileType};
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    if std::env::args_os().len() <= 1 {
+        return;
+    }
+    // SAFETY: `GetStdHandle` and `GetFileType` require no pointers and are safe to query at startup.
+    let (stdout_unattached, stderr_unattached) = unsafe {
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        let err = GetStdHandle(STD_ERROR_HANDLE);
+        (
+            out.is_null() || GetFileType(out) == FILE_TYPE_UNKNOWN,
+            err.is_null() || GetFileType(err) == FILE_TYPE_UNKNOWN,
+        )
+    };
+    if stdout_unattached && stderr_unattached {
+        // SAFETY: attaching to the parent console when neither standard handle is redirected is safe.
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
 }

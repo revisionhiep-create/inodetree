@@ -9,6 +9,7 @@ use crate::format::format_size;
 
 const INDENT_PER_LEVEL: f32 = 16.0;
 const ARROW_WIDTH: f32 = 14.0;
+const NAME_RIGHT_PADDING: f32 = 12.0;
 const FOLDER_COLOR: Color32 = Color32::from_rgb(120, 144, 190);
 const BAR_COLOR: Color32 = Color32::from_rgba_premultiplied(40, 70, 112, 63);
 const HIGHLIGHT_COLOR: Color32 = Color32::from_rgba_premultiplied(120, 90, 0, 120);
@@ -22,6 +23,24 @@ pub(super) fn name_cell(
 ) {
     let node = &view.arena.nodes[entry.id as usize];
     highlight_if_matching(ui, view, node);
+    let cell_width = ui.max_rect().width();
+    let text = view.arena.name(entry.id);
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    let text_width = ui.fonts(|fonts| {
+        fonts
+            .layout_no_wrap(text.to_owned(), font_id, Color32::PLACEHOLDER)
+            .rect
+            .width()
+    });
+    let needed = entry.depth as f32 * INDENT_PER_LEVEL
+        + ARROW_WIDTH
+        + 10.0
+        + ui.spacing().item_spacing.x * 3.0
+        + text_width
+        + NAME_RIGHT_PADDING;
+    pending.max_needed_name_width = pending.max_needed_name_width.max(needed);
+    pending.current_name_width = pending.current_name_width.max(cell_width);
+
     ui.add_space(entry.depth as f32 * INDENT_PER_LEVEL);
     if node.kind == NodeKind::Directory && node.first_child != NO_NODE {
         // Painted instead of a text glyph: the default egui font has no down-pointing triangle
@@ -37,7 +56,7 @@ pub(super) fn name_cell(
     let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
     ui.painter()
         .circle_filled(dot.center(), 4.0, node_color(view, node));
-    ui.add(Label::new(view.arena.name(entry.id)).selectable(false));
+    ui.add(Label::new(text).selectable(false));
 }
 
 fn node_color(view: &TreeView<'_>, node: &Node) -> Color32 {

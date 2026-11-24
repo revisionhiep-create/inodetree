@@ -1,4 +1,5 @@
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
@@ -41,13 +42,48 @@ fn totals_match_known_file_sizes() {
 fn symlink_to_ancestor_is_a_leaf() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("sub")).unwrap();
-    symlink(dir.path(), dir.path().join("sub/loop")).unwrap();
+    let link = dir.path().join("sub").join("loop");
+    #[cfg(unix)]
+    symlink(dir.path(), &link).unwrap();
+    #[cfg(windows)]
+    match std::os::windows::fs::symlink_dir(dir.path(), &link) {
+        Ok(()) => {}
+        Err(err) if err.raw_os_error() == Some(1314) => return,
+        Err(err) => panic!("failed to create directory symlink: {err}"),
+    }
 
     let arena = scan_path(dir.path()).arena;
     let link = find(&arena, "loop").unwrap();
     assert_eq!(arena.nodes[link as usize].kind, NodeKind::Symlink);
     assert_eq!(
         arena.nodes[link as usize].first_child,
+        inodetree::arena::NO_NODE
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn junction_to_ancestor_is_not_descended() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir(dir.path().join("sub")).unwrap();
+    let link = dir.path().join("sub").join("loop");
+    let output = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "mklink /J failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let arena = scan_path(dir.path()).arena;
+    let node = find(&arena, "loop").unwrap();
+    assert_eq!(arena.nodes[node as usize].kind, NodeKind::Directory);
+    assert_eq!(
+        arena.nodes[node as usize].first_child,
         inodetree::arena::NO_NODE
     );
 }
@@ -73,6 +109,7 @@ fn hardlinked_data_is_counted_once() {
     assert_eq!(duplicates, 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn unreadable_directory_is_counted_not_fatal() {
     if unsafe { libc::geteuid() } == 0 {
@@ -90,6 +127,7 @@ fn unreadable_directory_is_counted_not_fatal() {
     assert_eq!(result.arena.nodes[ROOT as usize].dir_count, 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn does_not_descend_into_other_filesystems() {
     let shm = Path::new("/dev/shm");

@@ -3,7 +3,7 @@ name = "inodetree"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
-description = "Fast Linux disk space analyzer"
+description = "Fast disk space analyzer"
 license = "MIT"
 repository = "https://github.com/Juanmidev1/inodetree"
 readme = "README.md"
@@ -11,12 +11,29 @@ readme = "README.md"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 # eframe 0.37+ requires Rust 1.95, above the project MSRV of 1.85
-eframe = { version = "0.32", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.32", default-features = false, features = ["glow", "default_fonts"] }
 egui_extras = "0.32"
-libc = "0.2"
 open = "5"
 rayon = "1"
 trash = "5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.32", default-features = false, features = ["wayland", "x11"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_SystemServices",
+    "Win32_System_WindowsProgramming",
+] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -34,6 +34,23 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
 
+  check-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: check-windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: check-windows-
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
   # Built inside AlmaLinux 9 so the binary links against glibc 2.34 and installs on RHEL 9 and newer
   package:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -94,8 +111,48 @@ jobs:
             dist/*.rpm
             dist/SHA256SUMS-*
 
+  package-windows:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: check-windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: package-windows-${{ hashFiles('Cargo.lock') }}
+          restore-keys: package-windows-
+      - name: Check the tag matches the crate version
+        shell: bash
+        run: |
+          crate_version=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "${tag_version%%-*}" != "$crate_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $crate_version"
+            exit 1
+          fi
+          echo "VERSION=$crate_version" >> "$GITHUB_ENV"
+      - run: cargo build --release --locked
+      - name: Package portable executable and checksums
+        shell: bash
+        run: |
+          name="inodetree-${VERSION}-windows-x86_64"
+          mkdir -p dist
+          cp target/release/inodetree.exe "dist/${name}.exe"
+          cd dist
+          sha256sum "${name}.exe" > SHA256SUMS-windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-windows
+          path: |
+            dist/*.exe
+            dist/SHA256SUMS-*
+
   release:
-    needs: package
+    needs: [package, package-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -115,4 +172,4 @@ jobs:
           case "$GITHUB_REF_NAME" in *-*) flags="$flags --prerelease" ;; esac
           # shellcheck disable=SC2086
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" $flags \
-            ./*.rpm ./*.tar.gz SHA256SUMS
+            ./*.rpm ./*.tar.gz ./*.exe SHA256SUMS

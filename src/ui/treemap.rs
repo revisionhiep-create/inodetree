@@ -1,11 +1,13 @@
 //! Interactive treemap panel: cached layout and mesh, hover tooltip, selection and zoom.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use eframe::egui::{Color32, Mesh, Rect, Sense, Shape, Stroke, StrokeKind, Ui};
 
 use super::breadcrumb;
 use super::context_menu::{self, RowAction};
+use super::tree_model::SelectionMode;
 use super::treemap_labels::{self, LabelSpot};
 use super::treemap_mesh::{BACKGROUND, build_mesh, fill_color, to_rect};
 use crate::arena::{Arena, NodeId, NodeKind};
@@ -31,11 +33,12 @@ pub struct TreemapView<'a> {
     pub highlighted_ext: Option<u16>,
     /// Search box result: files outside it are dimmed, like with an extension highlight
     pub filter: Option<&'a FilterMask>,
-    pub selected: Option<NodeId>,
+    pub selected: &'a HashSet<NodeId>,
 }
 
 pub enum TreemapEvent {
-    Select(NodeId),
+    Select(NodeId, SelectionMode),
+    SecondarySelect(NodeId),
     Action(RowAction),
 }
 
@@ -78,8 +81,17 @@ pub fn show(ui: &mut Ui, state: &mut TreemapState, view: &TreemapView<'_>) -> Op
     painter.rect_filled(response.rect, 0.0, BACKGROUND);
     painter.add(Shape::Mesh(Arc::clone(&cache.mesh)));
     treemap_labels::paint(&painter, response.rect, view.arena, &cache.labels);
-    if let Some(rect) = view.selected.and_then(|id| find_rect(&cache.rects, id)) {
-        painter.rect_stroke(rect, 0.0, SELECTION_STROKE, StrokeKind::Inside);
+    if !view.selected.is_empty() {
+        for rect in &cache.rects {
+            if view.selected.contains(&rect.id) {
+                painter.rect_stroke(
+                    to_rect(rect.bounds, 0.0),
+                    0.0,
+                    SELECTION_STROKE,
+                    StrokeKind::Inside,
+                );
+            }
+        }
     }
     let hovered = response
         .hover_pos()
@@ -87,16 +99,27 @@ pub fn show(ui: &mut Ui, state: &mut TreemapState, view: &TreemapView<'_>) -> Op
     if let Some(rect) = hovered.and_then(|id| find_rect(&cache.rects, id)) {
         painter.rect_stroke(rect, 0.0, HOVER_STROKE, StrokeKind::Inside);
     }
+    let mut event = None;
     if response.secondary_clicked() {
         state.menu_target = hovered;
+        if let Some(id) = hovered {
+            event = Some(TreemapEvent::SecondarySelect(id));
+        }
     }
-    let mut event = None;
     if let Some(id) = hovered {
         let is_directory = view.arena.nodes[id as usize].kind == NodeKind::Directory;
         if response.double_clicked() && is_directory {
             state.zoom = id;
         } else if response.clicked() {
-            event = Some(TreemapEvent::Select(id));
+            let modifiers = ui.input(|input| input.modifiers);
+            let mode = if modifiers.shift {
+                SelectionMode::Range
+            } else if modifiers.command {
+                SelectionMode::Toggle
+            } else {
+                SelectionMode::Replace
+            };
+            event = Some(TreemapEvent::Select(id, mode));
         }
         response
             .clone()
@@ -104,8 +127,13 @@ pub fn show(ui: &mut Ui, state: &mut TreemapState, view: &TreemapView<'_>) -> Op
     }
     // Right-clicking empty space must not open an empty menu, so only attach it to a real target
     if let Some(target) = state.menu_target {
+        let effective_count = if view.selected.contains(&target) {
+            view.selected.len()
+        } else {
+            1
+        };
         response.context_menu(|ui| {
-            if let Some(action) = context_menu::show(ui, target) {
+            if let Some(action) = context_menu::show(ui, target, effective_count) {
                 event = Some(TreemapEvent::Action(action));
             }
         });

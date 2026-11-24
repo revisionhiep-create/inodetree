@@ -1,5 +1,6 @@
-//! Discovery of real local filesystems from `/proc/self/mountinfo`.
+//! Discovery of real local filesystems (`/proc/self/mountinfo` on Linux, logical drives on Windows).
 
+#[cfg(unix)]
 use std::ffi::CString;
 use std::io;
 
@@ -21,6 +22,7 @@ pub struct MountInfo {
 }
 
 /// Lists mounted real filesystems with their capacity.
+#[cfg(unix)]
 pub fn list_mounts() -> io::Result<Vec<MountInfo>> {
     let content = std::fs::read_to_string("/proc/self/mountinfo")?;
     let mut mounts = parse_mountinfo(&content);
@@ -32,6 +34,120 @@ pub fn list_mounts() -> io::Result<Vec<MountInfo>> {
         }
     }
     Ok(mounts)
+}
+
+/// Lists mounted Windows drives with their volume label, filesystem, and capacity.
+#[cfg(windows)]
+pub fn list_mounts() -> io::Result<Vec<MountInfo>> {
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    use windows_sys::Win32::System::WindowsProgramming::{
+        DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE,
+    };
+
+    // SAFETY: `GetLogicalDrives` takes no pointers and returns a 26-bit drive mask.
+    let mask = unsafe { GetLogicalDrives() };
+    if mask == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut mounts = Vec::new();
+    for bit in 0..26_u8 {
+        if (mask & (1_u32 << bit)) == 0 {
+            continue;
+        }
+        let letter = char::from(b'A' + bit);
+        let mount_point = format!("{letter}:\\");
+        let root_wide: Vec<u16> = mount_point.encode_utf16().chain(Some(0)).collect();
+
+        // SAFETY: `root_wide` is NUL-terminated UTF-16.
+        let drive_type = unsafe { GetDriveTypeW(root_wide.as_ptr()) };
+        let is_supported = matches!(
+            drive_type,
+            DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_REMOTE | DRIVE_CDROM | DRIVE_RAMDISK
+        );
+        if !is_supported {
+            continue;
+        }
+
+        let space = windows_drive_space(&root_wide);
+        // Empty card readers and optical drives fail capacity queries; skip them so the picker stays clean.
+        if matches!(drive_type, DRIVE_REMOVABLE | DRIVE_CDROM) && space.is_none() {
+            continue;
+        }
+        let (total_bytes, free_bytes) = space.unwrap_or((0, 0));
+        let (label, filesystem) = windows_volume_info(&root_wide);
+        let fallback = match drive_type {
+            DRIVE_REMOVABLE => "Removable Disk",
+            DRIVE_REMOTE => "Network Drive",
+            DRIVE_CDROM => "Optical Drive",
+            DRIVE_RAMDISK => "RAM Disk",
+            _ => "Local Disk",
+        };
+        let base_label = if label.is_empty() { fallback } else { &label };
+        let device = if filesystem.is_empty() {
+            base_label.to_owned()
+        } else {
+            format!("{base_label} ({filesystem})")
+        };
+
+        mounts.push(MountInfo {
+            device,
+            mount_point,
+            filesystem,
+            total_bytes,
+            free_bytes,
+        });
+    }
+    Ok(mounts)
+}
+
+#[cfg(windows)]
+fn windows_drive_space(root_wide: &[u16]) -> Option<(u64, u64)> {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let mut free_to_caller = 0_u64;
+    let mut total_bytes = 0_u64;
+    // SAFETY: `root_wide` is NUL-terminated and both output pointers are valid writable `u64`s.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            root_wide.as_ptr(),
+            &raw mut free_to_caller,
+            &raw mut total_bytes,
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some((total_bytes, free_to_caller))
+}
+
+#[cfg(windows)]
+fn windows_volume_info(root_wide: &[u16]) -> (String, String) {
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
+
+    let mut label_buf = [0_u16; 261];
+    let mut fs_buf = [0_u16; 261];
+    // SAFETY: `root_wide` is NUL-terminated and both buffers match their passed lengths.
+    let ok = unsafe {
+        GetVolumeInformationW(
+            root_wide.as_ptr(),
+            label_buf.as_mut_ptr(),
+            label_buf.len() as u32,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            fs_buf.as_mut_ptr(),
+            fs_buf.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return (String::new(), String::new());
+    }
+    (utf16_z_to_string(&label_buf), utf16_z_to_string(&fs_buf))
+}
+
+#[cfg(windows)]
+fn utf16_z_to_string(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
 }
 
 /// Pure parser so it can be tested against fixed text.
@@ -90,6 +206,7 @@ fn decode_octal_escapes(raw: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
+#[cfg(unix)]
 fn filesystem_space(path: &str) -> io::Result<(u64, u64)> {
     let c_path = CString::new(path).map_err(|_| io::ErrorKind::InvalidInput)?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -110,6 +227,18 @@ fn filesystem_space(path: &str) -> io::Result<(u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lists_at_least_one_drive() {
+        let mounts = list_mounts().unwrap();
+        assert_ne!(mounts.len(), 0);
+        assert!(
+            mounts
+                .iter()
+                .all(|mount| mount.mount_point.ends_with(":\\") && mount.mount_point.len() == 3)
+        );
+    }
 
     const SAMPLE: &str = "\
 24 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw

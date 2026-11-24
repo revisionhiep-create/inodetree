@@ -1,9 +1,14 @@
-//! Parallel `getdents64` + `statx` directory walker.
+//! Parallel directory walker (`getdents64` + `statx` on Linux, `FileIdBothDirectoryInfo` on Windows).
 
 use std::cell::RefCell;
+#[cfg(windows)]
+use std::ffi::OsString;
+#[cfg(unix)]
 use std::ffi::{CString, OsString};
 use std::io;
+#[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
@@ -12,17 +17,28 @@ use std::time::Instant;
 
 use rayon::{Scope, ThreadPoolBuilder};
 
-use super::sys::{self, Metadata};
+use super::sys;
+#[cfg(unix)]
+use super::sys::Metadata;
 use super::{HardlinkSet, ScanConfig, ScanProgress, ScanResult};
 use crate::arena::{Arena, ChildBatch, NewNode, NodeId, NodeKind, ROOT};
 
+#[cfg(unix)]
 const DIRENT_BUFFER_BYTES: usize = 64 * 1024;
+#[cfg(windows)]
+const WIN_DIRENT_BUFFER_WORDS: usize = 8 * 1024;
 // More threads than this make a spinning disk's head jump between directories (thrashing),
 // which is slower than a few mostly sequential readers
 const HDD_SCAN_THREADS: usize = 3;
 
+#[cfg(unix)]
 thread_local! {
     static DIRENT_BUFFER: RefCell<Vec<u8>> = RefCell::new(vec![0; DIRENT_BUFFER_BYTES]);
+}
+
+#[cfg(windows)]
+thread_local! {
+    static WIN_DIRENT_BUFFER: RefCell<Vec<u64>> = RefCell::new(vec![0; WIN_DIRENT_BUFFER_WORDS]);
 }
 
 struct Context<'a> {
@@ -32,29 +48,55 @@ struct Context<'a> {
     config: &'a ScanConfig,
 }
 
-/// Subdirectories to descend into: batch index and the raw (possibly non-UTF-8) name.
+/// Subdirectories to descend into: batch index and the raw name.
 type Subdirs = Vec<(usize, OsString)>;
 
 pub fn scan(config: &ScanConfig) -> io::Result<ScanResult> {
     let started = Instant::now();
-    let root = std::fs::canonicalize(&config.root)?;
-    let root_meta = sys::statx_path(&root)?;
-    if root_meta.file_type() != libc::S_IFDIR {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "scan root is not a directory",
-        ));
-    }
+    let canonical = std::fs::canonicalize(&config.root)?;
+    #[cfg(windows)]
+    let root = sys::strip_verbatim_prefix(&canonical);
+    #[cfg(unix)]
+    let root = canonical;
+
+    #[cfg(unix)]
+    let (dev, logical_size, allocated_size, mtime_secs) = {
+        let root_meta = sys::statx_path(&root)?;
+        if root_meta.file_type() != libc::S_IFDIR {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "scan root is not a directory",
+            ));
+        }
+        (
+            root_meta.dev,
+            root_meta.size,
+            root_meta.blocks * 512,
+            root_meta.mtime_secs,
+        )
+    };
+
+    #[cfg(windows)]
+    let (dev, logical_size, allocated_size, mtime_secs) = {
+        let root_meta = sys::stat_root(&root)?;
+        (
+            root_meta.dev,
+            root_meta.logical_size,
+            root_meta.allocated_size,
+            root_meta.mtime_secs,
+        )
+    };
+
     let root_arena = Arena::with_root(
         &root.to_string_lossy(),
-        root_meta.size,
-        root_meta.blocks * 512,
-        root_meta.mtime_secs,
+        logical_size,
+        allocated_size,
+        mtime_secs,
     );
     let context = Context {
         arena: Mutex::new(root_arena),
         hardlinks: HardlinkSet::default(),
-        root_dev: root_meta.dev,
+        root_dev: dev,
         config,
     };
     walk(&context, &root);
@@ -72,8 +114,13 @@ pub fn scan(config: &ScanConfig) -> io::Result<ScanResult> {
 }
 
 fn walk(context: &Context<'_>, root: &Path) {
+    #[cfg(unix)]
+    let rotational = sys::is_rotational(context.root_dev);
+    #[cfg(windows)]
+    let rotational = sys::is_rotational(root);
+
     // If the small pool cannot be built the scan still runs, just on the global pool
-    let hdd_pool = sys::is_rotational(context.root_dev)
+    let hdd_pool = rotational
         .then(|| {
             ThreadPoolBuilder::new()
                 .num_threads(HDD_SCAN_THREADS)
@@ -99,7 +146,7 @@ fn scan_dir<'scope>(
     let (batch, subdirs) = match read_directory(context, path) {
         Ok(result) => result,
         Err(error) => {
-            if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
+            if error.kind() == io::ErrorKind::PermissionDenied {
                 context
                     .config
                     .progress
@@ -121,6 +168,7 @@ fn scan_dir<'scope>(
     }
 }
 
+#[cfg(unix)]
 fn read_directory(context: &Context<'_>, path: &Path) -> io::Result<(ChildBatch, Subdirs)> {
     let dir = sys::open_dir(path)?;
     let mut batch = ChildBatch::default();
@@ -134,8 +182,44 @@ fn read_directory(context: &Context<'_>, path: &Path) -> io::Result<(ChildBatch,
     Ok((batch, subdirs))
 }
 
+#[cfg(windows)]
+fn read_directory(context: &Context<'_>, path: &Path) -> io::Result<(ChildBatch, Subdirs)> {
+    let mut batch = ChildBatch::default();
+    let mut subdirs = Subdirs::new();
+    WIN_DIRENT_BUFFER.with(|buffer| {
+        sys::read_dir_entries(path, &mut buffer.borrow_mut(), |entry| {
+            let is_duplicate = entry.kind == NodeKind::File
+                && entry.file_id != 0
+                && !context
+                    .hardlinks
+                    .is_first_sighting(context.root_dev, entry.file_id);
+            let (logical_size, allocated_size) = if is_duplicate {
+                (0, 0)
+            } else {
+                (entry.logical_size, entry.allocated_size)
+            };
+            let name_start = batch.names.len();
+            batch.names.push_str(&entry.name.to_string_lossy());
+            if entry.should_descend {
+                subdirs.push((batch.entries.len(), entry.name));
+            }
+            batch.entries.push(NewNode {
+                name_start,
+                name_end: batch.names.len(),
+                kind: entry.kind,
+                logical_size,
+                allocated_size,
+                mtime_secs: entry.mtime_secs,
+                is_hardlink_duplicate: is_duplicate,
+            });
+        })
+    })?;
+    Ok((batch, subdirs))
+}
+
 /// Entries sorted by inode number, so the following `statx` calls read the inode table
 /// (or NTFS MFT) mostly sequentially instead of seeking at random on spinning disks.
+#[cfg(unix)]
 fn collect_entries_by_inode(dir: &OwnedFd) -> io::Result<Vec<(u64, CString)>> {
     let mut entries = Vec::new();
     DIRENT_BUFFER.with(|buffer| {
@@ -147,6 +231,7 @@ fn collect_entries_by_inode(dir: &OwnedFd) -> io::Result<Vec<(u64, CString)>> {
     Ok(entries)
 }
 
+#[cfg(unix)]
 fn add_entry(
     context: &Context<'_>,
     batch: &mut ChildBatch,

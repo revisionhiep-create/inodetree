@@ -6,6 +6,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use eframe::egui::{self, Event, Key, Modifiers};
 
+use super::background::dedupe_delete_targets;
 use super::context_menu::RowAction;
 use super::session::Session;
 use super::toolbar::FILTER_FIELD_ID;
@@ -26,7 +27,7 @@ pub struct App {
     pub(super) session: Option<Session>,
     pub(super) use_logical: bool,
     pub(super) error: Option<String>,
-    pub(super) confirming_delete: Option<NodeId>,
+    pub(super) confirming_delete: Vec<NodeId>,
     // Ids of deletions in flight, so a rescan in between cannot apply them to a new arena
     pub(super) pending_deletes: HashSet<NodeId>,
     pub(super) action_sender: Sender<ActionResult>,
@@ -50,7 +51,7 @@ impl App {
             session: None,
             use_logical: false,
             error: None,
-            confirming_delete: None,
+            confirming_delete: Vec::new(),
             pending_deletes: HashSet::new(),
             action_sender,
             action_receiver,
@@ -64,8 +65,11 @@ impl App {
 
     fn handle_treemap_event(&mut self, event: Option<TreemapEvent>) {
         match (event, &mut self.session) {
-            (Some(TreemapEvent::Select(id)), Some(session)) => {
-                session.tree.select_and_reveal(&session.arena, id);
+            (Some(TreemapEvent::Select(id, mode)), Some(session)) => {
+                session.tree.select_and_reveal(&session.arena, id, mode);
+            }
+            (Some(TreemapEvent::SecondarySelect(id)), Some(session)) => {
+                session.tree.ensure_selected_for_menu(id);
             }
             (Some(TreemapEvent::Action(action)), _) => self.apply_action(action),
             _ => {}
@@ -86,16 +90,24 @@ impl App {
         if ctx.input_mut(|input| input.consume_key(Modifiers::COMMAND, Key::F)) {
             ctx.memory_mut(|memory| memory.request_focus(egui::Id::new(FILTER_FIELD_ID)));
         }
-        if ctx.wants_keyboard_input() {
+        if !self.confirming_delete.is_empty() || ctx.wants_keyboard_input() {
             return;
         }
         let selected = self
             .session
             .as_ref()
-            .and_then(|session| session.tree.selected);
+            .and_then(|session| session.tree.selected_in_order().into_iter().next());
         let (permanent, trash, copy, rescan) = ctx.input_mut(|input| {
+            // `egui-winit` translates Shift+Delete on Windows into `Event::Cut` without a Delete key event.
+            let shift_delete_cut = cfg!(windows)
+                && input.modifiers.shift
+                && !input.modifiers.command
+                && input.events.iter().any(|event| matches!(event, Event::Cut));
+            if shift_delete_cut {
+                input.events.retain(|event| !matches!(event, Event::Cut));
+            }
             (
-                input.consume_key(Modifiers::SHIFT, Key::Delete),
+                input.consume_key(Modifiers::SHIFT, Key::Delete) || shift_delete_cut,
                 input.consume_key(Modifiers::NONE, Key::Delete),
                 input
                     .events
@@ -122,12 +134,38 @@ impl App {
             RowAction::OpenInFileManager(id) => self.open_in_file_manager(id),
             RowAction::CopyPath(id) => {
                 if let Some(session) = &self.session {
-                    self.context.copy_text(session.arena.path_of(id));
+                    let targets = action_targets(session, id);
+                    let sep = if cfg!(windows) { "\r\n" } else { "\n" };
+                    let text: Vec<String> = targets
+                        .into_iter()
+                        .map(|target| session.arena.path_of(target))
+                        .collect();
+                    self.context.copy_text(text.join(sep));
                 }
             }
-            RowAction::MoveToTrash(id) => self.start_delete(id, DeleteMode::Trash),
-            RowAction::DeletePermanently(id) => self.confirming_delete = Some(id),
+            RowAction::MoveToTrash(id) => {
+                let Some(session) = &self.session else { return };
+                let targets = dedupe_delete_targets(&session.arena, &action_targets(session, id));
+                if !targets.is_empty() {
+                    self.start_delete_many(&targets, DeleteMode::Trash);
+                }
+            }
+            RowAction::DeletePermanently(id) => {
+                let Some(session) = &self.session else { return };
+                let targets = dedupe_delete_targets(&session.arena, &action_targets(session, id));
+                if !targets.is_empty() {
+                    self.confirming_delete = targets;
+                }
+            }
         }
+    }
+}
+
+fn action_targets(session: &Session, id: NodeId) -> Vec<NodeId> {
+    if session.tree.selected.contains(&id) {
+        session.tree.selected_in_order()
+    } else {
+        vec![id]
     }
 }
 

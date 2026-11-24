@@ -140,10 +140,15 @@ impl Arena {
             components.push(self.name(current));
             current = self.nodes[current as usize].parent;
         }
+        let sep = if components.last().is_some_and(|root| root.contains('\\')) {
+            '\\'
+        } else {
+            '/'
+        };
         let mut path = String::new();
         for component in components.into_iter().rev() {
-            if !path.is_empty() && !path.ends_with('/') {
-                path.push('/');
+            if !path.is_empty() && !path.ends_with(['/', '\\']) {
+                path.push(sep);
             }
             path.push_str(component);
         }
@@ -193,5 +198,31 @@ mod tests {
     #[test]
     fn node_stays_within_the_size_budget() {
         assert!(std::mem::size_of::<Node>() <= 56);
+    }
+
+    #[test]
+    fn path_of_preserves_windows_and_unix_separators() {
+        let mut win_root = Arena::with_root("C:\\", 0, 0, 0);
+        let mut batch = ChildBatch::default();
+        batch.names.push_str("Users");
+        batch.entries.push(NewNode {
+            name_start: 0,
+            name_end: 5,
+            kind: NodeKind::Directory,
+            logical_size: 0,
+            allocated_size: 0,
+            mtime_secs: 0,
+            is_hardlink_duplicate: false,
+        });
+        let users = win_root.append_children(ROOT, &batch);
+        assert_eq!(win_root.path_of(users), "C:\\Users");
+
+        let mut win_sub = Arena::with_root("C:\\Users", 0, 0, 0);
+        let file = win_sub.append_children(ROOT, &batch);
+        assert_eq!(win_sub.path_of(file), "C:\\Users\\Users");
+
+        let mut unc = Arena::with_root("\\\\server\\share", 0, 0, 0);
+        let share_dir = unc.append_children(ROOT, &batch);
+        assert_eq!(unc.path_of(share_dir), "\\\\server\\share\\Users");
     }
 }

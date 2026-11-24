@@ -41,15 +41,14 @@ downloads are code-signed.
 
 ### Windows (Portable `.exe`)
 
-1. Download the standalone executable from [GitHub Releases](https://github.com/revisionhiep-create/inodetree/releases):
-   - Direct link: [Download inodetree-0.1.1-windows-x86_64.exe](https://github.com/revisionhiep-create/inodetree/releases/download/v0.1.1/inodetree-0.1.1-windows-x86_64.exe)
-2. Save it to any folder (or a USB drive) and double-click to run — no installer and no Visual
-   C++ Redistributable are required.
+1. Download the standalone executable directly from the repository root:
+   - Direct link: [Download inodetree.exe](https://github.com/revisionhiep-create/inodetree/raw/main/inodetree.exe)
+2. Save `inodetree.exe` to any folder (or a USB drive) and double-click to run — no installer and
+   no Visual C++ Redistributable are required.
 3. Because the binary is unsigned, Windows SmartScreen may show a prompt on first launch; choose
    **More info → Run anyway** if you trust the build.
 4. To scan protected system directories (such as `C:\Windows` or other users' folders), run
-   `inodetree-0.1.1-windows-x86_64.exe` as Administrator. Unreadable folders are skipped and
-   counted in the status bar.
+   `inodetree.exe` as Administrator. Unreadable folders are skipped and counted in the status bar.
 
 ### Fedora, RHEL, Rocky, AlmaLinux
 

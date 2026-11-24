@@ -1,6 +1,6 @@
-//! Top bar: drive selector, path input, scan control and size mode.
+//! Top bar: drive selector, path input, scan control, size mode, and disk space bar.
 
-use eframe::egui::{self, Key, Ui};
+use eframe::egui::{self, Color32, Key, Rect, Sense, StrokeKind, Ui, Vec2};
 
 use crate::format::{format_count, format_size};
 use crate::mounts::MountInfo;
@@ -14,25 +14,33 @@ pub enum ToolbarEvent {
 /// Widget id of the search box, so `Ctrl+F` can focus it from outside the toolbar.
 pub const FILTER_FIELD_ID: &str = "filter_input";
 
+const DISK_BAR_SIZE: Vec2 = Vec2::new(100.0, 14.0);
+const DISK_TRACK_COLOR: Color32 = Color32::from_rgb(42, 46, 56);
+const DISK_BORDER_COLOR: Color32 = Color32::from_rgb(72, 78, 92);
+const DISK_OK_COLOR: Color32 = Color32::from_rgb(56, 138, 224);
+const DISK_WARN_COLOR: Color32 = Color32::from_rgb(230, 165, 45);
+const DISK_FULL_COLOR: Color32 = Color32::from_rgb(220, 76, 65);
+
 pub struct ToolbarState<'a> {
     pub path_input: &'a mut String,
     pub filter_input: &'a mut String,
     pub match_count: Option<usize>,
     pub mounts: &'a [MountInfo],
+    pub active_mount: Option<&'a MountInfo>,
     pub use_logical: &'a mut bool,
     pub is_scanning: bool,
 }
 
 pub fn show(ui: &mut Ui, state: &mut ToolbarState<'_>) -> Option<ToolbarEvent> {
     let mut event = None;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if drive_picker(ui, state.mounts, state.path_input) {
             event = Some(ToolbarEvent::StartScan);
         }
         let path_field = ui.add(
             egui::TextEdit::singleline(state.path_input)
                 .hint_text("Path to scan")
-                .desired_width(280.0),
+                .desired_width(240.0),
         );
         let submitted = path_field.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
         if state.is_scanning {
@@ -47,6 +55,10 @@ pub fn show(ui: &mut Ui, state: &mut ToolbarState<'_>) -> Option<ToolbarEvent> {
         ui.separator();
         ui.selectable_value(state.use_logical, false, "Allocated size");
         ui.selectable_value(state.use_logical, true, "Logical size");
+        if let Some(mount) = state.active_mount {
+            ui.separator();
+            disk_space_bar(ui, mount);
+        }
     });
     event
 }
@@ -56,7 +68,7 @@ fn filter_field(ui: &mut Ui, filter_input: &mut String, match_count: Option<usiz
         egui::TextEdit::singleline(filter_input)
             .id(egui::Id::new(FILTER_FIELD_ID))
             .hint_text("Filter: name or *.ext (Ctrl+F)")
-            .desired_width(190.0),
+            .desired_width(170.0),
     );
     let escape_pressed = ui.input(|input| input.key_pressed(Key::Escape));
     if (field.has_focus() || field.lost_focus()) && escape_pressed {
@@ -66,6 +78,56 @@ fn filter_field(ui: &mut Ui, filter_input: &mut String, match_count: Option<usiz
     if let Some(count) = match_count {
         ui.label(format!("{} matches", format_count(count as u64)));
     }
+}
+
+fn disk_space_bar(ui: &mut Ui, mount: &MountInfo) {
+    let used = mount.total_bytes.saturating_sub(mount.free_bytes);
+    let fraction = if mount.total_bytes == 0 {
+        0.0
+    } else {
+        (used as f64 / mount.total_bytes as f64).clamp(0.0, 1.0) as f32
+    };
+    let percent = fraction * 100.0;
+    let fill_color = if fraction >= 0.90 {
+        DISK_FULL_COLOR
+    } else if fraction >= 0.75 {
+        DISK_WARN_COLOR
+    } else {
+        DISK_OK_COLOR
+    };
+
+    let (rect, response) = ui.allocate_exact_size(DISK_BAR_SIZE, Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 3.0, DISK_TRACK_COLOR);
+    if fraction > 0.0 {
+        let filled = Rect::from_min_size(
+            rect.min,
+            Vec2::new((rect.width() * fraction).max(2.0), rect.height()),
+        );
+        painter.rect_filled(filled, 3.0, fill_color);
+    }
+    painter.rect_stroke(rect, 3.0, (1.0, DISK_BORDER_COLOR), StrokeKind::Inside);
+
+    response.on_hover_ui(|ui| {
+        ui.strong(&mount.mount_point);
+        if !mount.filesystem.is_empty() {
+            ui.label(format!("Filesystem: {}", mount.filesystem));
+        }
+        ui.label(format!("Used: {} ({percent:.1}%)", format_size(used)));
+        ui.label(format!(
+            "Free: {} ({:.1}%)",
+            format_size(mount.free_bytes),
+            100.0 - percent,
+        ));
+        ui.label(format!("Total: {}", format_size(mount.total_bytes)));
+    });
+
+    ui.label(format!(
+        "{} used / {} ({} free)",
+        format_size(used),
+        format_size(mount.total_bytes),
+        format_size(mount.free_bytes),
+    ));
 }
 
 /// Returns `true` when the user picked a mount, whose path is written to `path_input`.

@@ -13,19 +13,26 @@ use super::toolbar::{self, ToolbarEvent, ToolbarState};
 use super::tree_view::{self, TreeView};
 use super::treemap::{self, TreemapEvent, TreemapView};
 use crate::actions::DeleteMode;
-use crate::arena::NodeId;
+use crate::arena::{NodeId, ROOT};
 use crate::format::{format_count, format_size};
+use crate::mounts;
 
 const WARNING_COLOR: Color32 = Color32::from_rgb(230, 170, 40);
 
 impl App {
     pub(super) fn show_toolbar(&mut self, ui: &mut egui::Ui) {
         let was_logical = self.use_logical;
+        let active_path = self
+            .session
+            .as_ref()
+            .map_or(self.path_input.as_str(), |session| session.arena.name(ROOT));
+        let active_mount = mounts::mount_for_path(&self.mounts, active_path);
         let mut state = ToolbarState {
             path_input: &mut self.path_input,
             filter_input: &mut self.filter_input,
             match_count: self.session.as_ref().and_then(Session::match_count),
             mounts: &self.mounts,
+            active_mount,
             use_logical: &mut self.use_logical,
             is_scanning: self.job.is_some(),
         };

@@ -74,6 +74,7 @@ impl App {
                 self.session = Some(session);
                 self.pending_deletes.clear();
                 self.confirming_delete.clear();
+                self.load_mounts();
             }
             // A cancelled scan keeps the previous tree on screen
             Ok(_) => {}
@@ -98,6 +99,7 @@ impl App {
             if let Some(session) = &mut self.session {
                 session.refresh_after_delete();
             }
+            self.load_mounts();
         }
     }
 

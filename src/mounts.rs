@@ -156,6 +156,47 @@ pub fn parse_mountinfo(content: &str) -> Vec<MountInfo> {
     content.lines().filter_map(parse_line).collect()
 }
 
+/// Finds the mount with the longest `mount_point` prefix matching `path` and a known capacity.
+#[must_use]
+pub fn mount_for_path<'a>(mounts: &'a [MountInfo], path: &str) -> Option<&'a MountInfo> {
+    mounts
+        .iter()
+        .filter(|mount| mount.total_bytes > 0 && path_matches_mount(path, &mount.mount_point))
+        .max_by_key(|mount| mount.mount_point.len())
+}
+
+fn path_matches_mount(path: &str, mount_point: &str) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if mount_point.contains('\\') {
+        let norm_path = trimmed.replace('/', "\\").to_ascii_lowercase();
+        let norm_mount = mount_point.to_ascii_lowercase();
+        if norm_path.len() == 2
+            && norm_path.as_bytes()[1] == b':'
+            && norm_mount.len() == 3
+            && norm_mount.ends_with(":\\")
+        {
+            return norm_path.as_bytes()[0] == norm_mount.as_bytes()[0];
+        }
+        if norm_mount.ends_with('\\') {
+            return norm_path.starts_with(&norm_mount);
+        }
+        return norm_path == norm_mount
+            || norm_path
+                .strip_prefix(&norm_mount)
+                .is_some_and(|rest| rest.starts_with('\\'));
+    }
+    if mount_point == "/" {
+        return trimmed.starts_with('/');
+    }
+    trimmed == mount_point
+        || trimmed
+            .strip_prefix(mount_point)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
 fn parse_line(line: &str) -> Option<MountInfo> {
     // Fields before " - " are variable-length, so the filesystem part is located by the separator
     let (before, after) = line.split_once(" - ")?;
@@ -271,5 +312,58 @@ mod tests {
         let mounts = parse_mountinfo(SAMPLE);
         assert_eq!(mounts[0].device, "/dev/nvme0n1p2");
         assert_eq!(mounts[1].filesystem, "ntfs3");
+    }
+
+    #[test]
+    fn mount_for_path_picks_longest_matching_prefix_with_capacity() {
+        let mounts = vec![
+            MountInfo {
+                device: "root".into(),
+                mount_point: "/".into(),
+                filesystem: "ext4".into(),
+                total_bytes: 1000,
+                free_bytes: 400,
+            },
+            MountInfo {
+                device: "home".into(),
+                mount_point: "/home".into(),
+                filesystem: "ext4".into(),
+                total_bytes: 2000,
+                free_bytes: 500,
+            },
+            MountInfo {
+                device: "win-c".into(),
+                mount_point: "C:\\".into(),
+                filesystem: "NTFS".into(),
+                total_bytes: 5000,
+                free_bytes: 1000,
+            },
+            MountInfo {
+                device: "win-empty".into(),
+                mount_point: "D:\\".into(),
+                filesystem: "NTFS".into(),
+                total_bytes: 0,
+                free_bytes: 0,
+            },
+        ];
+
+        assert_eq!(
+            mount_for_path(&mounts, "/home/user/docs").map(|m| m.mount_point.as_str()),
+            Some("/home")
+        );
+        assert_eq!(
+            mount_for_path(&mounts, "/home2/user").map(|m| m.mount_point.as_str()),
+            Some("/")
+        );
+        assert_eq!(
+            mount_for_path(&mounts, "c:/Users/test").map(|m| m.mount_point.as_str()),
+            Some("C:\\")
+        );
+        assert_eq!(
+            mount_for_path(&mounts, "C:").map(|m| m.mount_point.as_str()),
+            Some("C:\\")
+        );
+        assert_eq!(mount_for_path(&mounts, "D:\\Games"), None);
+        assert_eq!(mount_for_path(&mounts, ""), None);
     }
 }
